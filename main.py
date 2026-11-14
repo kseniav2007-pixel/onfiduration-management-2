@@ -69,24 +69,21 @@ def validate_config(config):
     if not repository:
         raise ValueError("Репозиторий не указан")
 
+    if not version:
+        raise ValueError("Версия пакета не указана")
+
     if mode == "true":
         if not re.fullmatch(r"[A-Z]+", name):
             raise ValueError(
-                "В тестовом режиме имя пакета должно содержать "
-                "только большие латинские буквы"
+                "В тестовом режиме используются только "
+                "большие латинские буквы"
             )
 
         if not Path(repository).is_file():
             raise ValueError("Тестовый репозиторий не найден")
-
-        if not version:
-            raise ValueError("Версия не указана")
     else:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name):
             raise ValueError("Некорректное имя пакета")
-
-        if not version:
-            raise ValueError("Версия не указана")
 
         parsed = urlparse(repository)
 
@@ -177,7 +174,7 @@ def parse_test_repository(text):
 
         if not re.fullmatch(r"[A-Z]+", name):
             raise ValueError(
-                f"Строка {number}: некорректное имя пакета {name}"
+                f"Строка {number}: некорректное имя {name}"
             )
 
         if name in graph:
@@ -195,8 +192,8 @@ def parse_test_repository(text):
         for dependency in dependencies:
             if dependency not in graph:
                 raise ValueError(
-                    f"Пакет {name} зависит от неизвестного "
-                    f"пакета {dependency}"
+                    f"Пакет {name} зависит от "
+                    f"неизвестного пакета {dependency}"
                 )
 
     return graph
@@ -210,6 +207,7 @@ def dependency_name(dependency):
         return dependency
 
     name = re.split(r"[<>=~]", dependency, maxsplit=1)[0]
+
     return name if name else None
 
 
@@ -319,6 +317,45 @@ def find_cycles(graph):
     return cycles
 
 
+def get_load_order(graph, start):
+    order = []
+    state = {}
+    path = []
+
+    def visit(package):
+        status = state.get(package, 0)
+
+        if status == 1:
+            position = path.index(package)
+            cycle = path[position:] + [package]
+            raise ValueError(
+                "Невозможно определить порядок загрузки. "
+                "Цикл: " + " -> ".join(cycle)
+            )
+
+        if status == 2:
+            return
+
+        if package not in graph:
+            raise ValueError(
+                f"Не найдены данные о зависимости: {package}"
+            )
+
+        state[package] = 1
+        path.append(package)
+
+        for dependency in graph[package]:
+            visit(dependency)
+
+        path.pop()
+        state[package] = 2
+        order.append(package)
+
+    visit(start)
+
+    return order
+
+
 def print_graph(graph, start):
     print(f"\nГраф зависимостей пакета {start}:")
 
@@ -349,6 +386,19 @@ def print_graph(graph, start):
         print("Циклов не обнаружено")
 
 
+def print_load_order(graph, start):
+    print("\nПорядок загрузки зависимостей:")
+
+    try:
+        order = get_load_order(graph, start)
+
+        for number, package in enumerate(order, start=1):
+            print(f"{number}. {package}")
+
+    except ValueError as error:
+        print(f"Порядок загрузки не определён: {error}")
+
+
 def main():
     filename = sys.argv[1] if len(sys.argv) > 1 else "config.csv"
 
@@ -367,7 +417,8 @@ def main():
                     f"Пакет {name} отсутствует в тестовом репозитории"
                 )
 
-            get_dependencies = lambda package: test_graph[package]
+            def get_dependencies(package):
+                return test_graph[package]
         else:
             text = get_repository_data(config)
             packages = parse_index(text)
@@ -382,7 +433,9 @@ def main():
             )
 
         graph = build_graph(name, get_dependencies)
+
         print_graph(graph, name)
+        print_load_order(graph, name)
 
     except (
         OSError,
