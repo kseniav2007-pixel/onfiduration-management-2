@@ -4,6 +4,7 @@ import io
 import re
 import sys
 import tarfile
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -56,34 +57,37 @@ def validate_config(config):
         )
 
     name = config["package_name"]
-
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
-        raise ValueError("Некорректное имя пакета")
-
     version = config["version"]
-
-    if not re.fullmatch(
-        r"\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?",
-        version
-    ):
-        raise ValueError("Некорректная версия пакета")
-
     mode = config["test_mode"].lower()
+    repository = config["repository"]
 
     if mode not in ("true", "false"):
         raise ValueError("test_mode должен быть true или false")
 
     config["test_mode"] = mode
 
-    repository = config["repository"]
-
     if not repository:
         raise ValueError("Репозиторий не указан")
 
     if mode == "true":
+        if not re.fullmatch(r"[A-Z]+", name):
+            raise ValueError(
+                "В тестовом режиме имя пакета должно содержать "
+                "только большие латинские буквы"
+            )
+
         if not Path(repository).is_file():
             raise ValueError("Тестовый репозиторий не найден")
+
+        if not version:
+            raise ValueError("Версия не указана")
     else:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name):
+            raise ValueError("Некорректное имя пакета")
+
+        if not version:
+            raise ValueError("Версия не указана")
+
         parsed = urlparse(repository)
 
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -115,9 +119,11 @@ def parse_index(text):
 def read_index_archive(data):
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
         member = next(
-            (item for item in archive.getmembers()
-             if item.name.lstrip("./") == "APKINDEX"
-             and item.isfile()),
+            (
+                item for item in archive.getmembers()
+                if item.name.lstrip("./") == "APKINDEX"
+                and item.isfile()
+            ),
             None
         )
 
@@ -136,13 +142,7 @@ def get_repository_data(config):
     repository = config["repository"]
 
     if config["test_mode"] == "true":
-        path = Path(repository)
-
-        if path.name.endswith(".tar.gz"):
-            data = path.read_bytes()
-            return read_index_archive(data)
-
-        return path.read_text(encoding="utf-8-sig")
+        return Path(repository).read_text(encoding="utf-8-sig")
 
     if repository.endswith("APKINDEX.tar.gz"):
         url = repository
@@ -157,14 +157,196 @@ def get_repository_data(config):
     return read_index_archive(data)
 
 
-def get_direct_dependencies(packages, name, version):
-    for package in packages:
-        if package["P"] == name and package["V"] == version:
-            return package.get("D", "").split()
+def parse_test_repository(text):
+    graph = {}
 
-    raise ValueError(
-        f"Пакет {name} версии {version} не найден в репозитории"
+    for number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if ":" not in line:
+            raise ValueError(
+                f"Строка {number}: отсутствует двоеточие"
+            )
+
+        name, dependencies = line.split(":", 1)
+        name = name.strip()
+        items = dependencies.split()
+
+        if not re.fullmatch(r"[A-Z]+", name):
+            raise ValueError(
+                f"Строка {number}: некорректное имя пакета {name}"
+            )
+
+        if name in graph:
+            raise ValueError(f"Повторяющийся пакет: {name}")
+
+        for dependency in items:
+            if not re.fullmatch(r"[A-Z]+", dependency):
+                raise ValueError(
+                    f"Некорректная зависимость: {dependency}"
+                )
+
+        graph[name] = list(dict.fromkeys(items))
+
+    for name, dependencies in graph.items():
+        for dependency in dependencies:
+            if dependency not in graph:
+                raise ValueError(
+                    f"Пакет {name} зависит от неизвестного "
+                    f"пакета {dependency}"
+                )
+
+    return graph
+
+
+def dependency_name(dependency):
+    if dependency.startswith("!"):
+        return None
+
+    if ":" in dependency.split("=")[0]:
+        return dependency
+
+    name = re.split(r"[<>=~]", dependency, maxsplit=1)[0]
+    return name if name else None
+
+
+def build_package_index(packages):
+    index = {}
+
+    for package in packages:
+        name = package["P"]
+
+        if name not in index:
+            index[name] = package
+
+    return index
+
+
+def make_real_dependency_provider(packages, root_name, root_version):
+    root = next(
+        (
+            package for package in packages
+            if package["P"] == root_name
+            and package["V"] == root_version
+        ),
+        None
     )
+
+    if root is None:
+        raise ValueError(
+            f"Пакет {root_name} версии {root_version} не найден"
+        )
+
+    index = build_package_index(packages)
+
+    def get_dependencies(name):
+        if name == root_name:
+            package = root
+        else:
+            package = index.get(name)
+
+        if package is None:
+            return []
+
+        result = []
+
+        for raw in package.get("D", "").split():
+            dependency = dependency_name(raw)
+
+            if dependency and dependency not in result:
+                result.append(dependency)
+
+        return result
+
+    return get_dependencies
+
+
+def bfs_recursive(queue, visited, graph, get_dependencies):
+    if not queue:
+        return
+
+    current = queue.popleft()
+    dependencies = get_dependencies(current)
+    graph[current] = dependencies
+
+    for dependency in dependencies:
+        if dependency not in visited:
+            visited.add(dependency)
+            queue.append(dependency)
+
+    bfs_recursive(queue, visited, graph, get_dependencies)
+
+
+def build_graph(start, get_dependencies):
+    queue = deque([start])
+    visited = {start}
+    graph = {}
+
+    bfs_recursive(queue, visited, graph, get_dependencies)
+
+    return graph
+
+
+def find_cycles(graph):
+    color = {}
+    path = []
+    cycles = []
+
+    def visit(node):
+        color[node] = 1
+        path.append(node)
+
+        for neighbor in graph.get(node, []):
+            if color.get(neighbor, 0) == 0:
+                visit(neighbor)
+            elif color.get(neighbor) == 1:
+                start = path.index(neighbor)
+                cycle = path[start:] + [neighbor]
+
+                if cycle not in cycles:
+                    cycles.append(cycle)
+
+        path.pop()
+        color[node] = 2
+
+    for node in graph:
+        if color.get(node, 0) == 0:
+            visit(node)
+
+    return cycles
+
+
+def print_graph(graph, start):
+    print(f"\nГраф зависимостей пакета {start}:")
+
+    for package, dependencies in graph.items():
+        if dependencies:
+            print(f"{package} -> {', '.join(dependencies)}")
+        else:
+            print(f"{package} -> нет зависимостей")
+
+    all_dependencies = set(graph)
+    all_dependencies.discard(start)
+
+    print("\nВсе достижимые зависимости:")
+
+    if all_dependencies:
+        print(", ".join(sorted(all_dependencies)))
+    else:
+        print("Нет зависимостей")
+
+    cycles = find_cycles(graph)
+
+    print("\nПроверка циклов:")
+
+    if cycles:
+        for cycle in cycles:
+            print("Обнаружен цикл: " + " -> ".join(cycle))
+    else:
+        print("Циклов не обнаружено")
 
 
 def main():
@@ -174,27 +356,33 @@ def main():
         config = load_config(filename)
         validate_config(config)
 
-        index_text = get_repository_data(config)
-        packages = parse_index(index_text)
+        name = config["package_name"]
 
-        if not packages:
-            raise ValueError("В индексе не найдено записей о пакетах")
+        if config["test_mode"] == "true":
+            text = get_repository_data(config)
+            test_graph = parse_test_repository(text)
 
-        dependencies = get_direct_dependencies(
-            packages,
-            config["package_name"],
-            config["version"]
-        )
+            if name not in test_graph:
+                raise ValueError(
+                    f"Пакет {name} отсутствует в тестовом репозитории"
+                )
 
-        print(f"\nПакет: {config['package_name']}")
-        print(f"Версия: {config['version']}")
-        print("Прямые зависимости:")
-
-        if dependencies:
-            for dependency in dependencies:
-                print(f"- {dependency}")
+            get_dependencies = lambda package: test_graph[package]
         else:
-            print("Прямых зависимостей нет")
+            text = get_repository_data(config)
+            packages = parse_index(text)
+
+            if not packages:
+                raise ValueError("Индекс пакетов пуст")
+
+            get_dependencies = make_real_dependency_provider(
+                packages,
+                name,
+                config["version"]
+            )
+
+        graph = build_graph(name, get_dependencies)
+        print_graph(graph, name)
 
     except (
         OSError,
@@ -203,7 +391,8 @@ def main():
         ValueError,
         HTTPError,
         URLError,
-        tarfile.TarError
+        tarfile.TarError,
+        RecursionError
     ) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         sys.exit(1)
