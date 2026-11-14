@@ -75,8 +75,8 @@ def validate_config(config):
     if mode == "true":
         if not re.fullmatch(r"[A-Z]+", name):
             raise ValueError(
-                "В тестовом режиме используются только "
-                "большие латинские буквы"
+                "В тестовом режиме имя пакета должно "
+                "содержать только большие латинские буквы"
             )
 
         if not Path(repository).is_file():
@@ -114,7 +114,9 @@ def parse_index(text):
 
 
 def read_index_archive(data):
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+    with tarfile.open(
+        fileobj=io.BytesIO(data), mode="r:gz"
+    ) as archive:
         member = next(
             (
                 item for item in archive.getmembers()
@@ -146,7 +148,7 @@ def get_repository_data(config):
     else:
         url = repository.rstrip("/") + "/APKINDEX.tar.gz"
 
-    print(f"Загрузка индекса: {url}")
+    print(f"Загрузка индекса: {url}", file=sys.stderr)
 
     with urlopen(url, timeout=20) as response:
         data = response.read()
@@ -206,7 +208,9 @@ def dependency_name(dependency):
     if ":" in dependency.split("=")[0]:
         return dependency
 
-    name = re.split(r"[<>=~]", dependency, maxsplit=1)[0]
+    name = re.split(
+        r"[<>=~]", dependency, maxsplit=1
+    )[0]
 
     return name if name else None
 
@@ -328,6 +332,7 @@ def get_load_order(graph, start):
         if status == 1:
             position = path.index(package)
             cycle = path[position:] + [package]
+
             raise ValueError(
                 "Невозможно определить порядок загрузки. "
                 "Цикл: " + " -> ".join(cycle)
@@ -399,6 +404,53 @@ def print_load_order(graph, start):
         print(f"Порядок загрузки не определён: {error}")
 
 
+def generate_plantuml(graph, start):
+    names = list(graph)
+
+    for dependencies in graph.values():
+        for dependency in dependencies:
+            if dependency not in names:
+                names.append(dependency)
+
+    aliases = {
+        name: f"P{number}"
+        for number, name in enumerate(names)
+    }
+
+    lines = [
+        "@startuml",
+        "left to right direction",
+        "skinparam componentStyle rectangle",
+        f"title Dependencies of {start}",
+        ""
+    ]
+
+    for name in names:
+        safe_name = name.replace('"', "'")
+        alias = aliases[name]
+
+        lines.append(
+            f'component "{safe_name}" as {alias}'
+        )
+
+    lines.append("")
+
+    for package, dependencies in graph.items():
+        for dependency in dependencies:
+            source = aliases[package]
+            target = aliases[dependency]
+            lines.append(f"{source} --> {target}")
+
+    lines.append("")
+    lines.append("@enduml")
+
+    return "\n".join(lines)
+
+
+def save_plantuml(text, filename):
+    Path(filename).write_text(text + "\n", encoding="utf-8")
+
+
 def main():
     filename = sys.argv[1] if len(sys.argv) > 1 else "config.csv"
 
@@ -414,11 +466,13 @@ def main():
 
             if name not in test_graph:
                 raise ValueError(
-                    f"Пакет {name} отсутствует в тестовом репозитории"
+                    f"Пакет {name} отсутствует "
+                    f"в тестовом репозитории"
                 )
 
             def get_dependencies(package):
                 return test_graph[package]
+
         else:
             text = get_repository_data(config)
             packages = parse_index(text)
@@ -436,6 +490,16 @@ def main():
 
         print_graph(graph, name)
         print_load_order(graph, name)
+
+        plantuml_text = generate_plantuml(graph, name)
+
+        print("\nОписание графа на языке PlantUML:\n")
+        print(plantuml_text)
+
+        output_file = f"graph_{name}.puml"
+        save_plantuml(plantuml_text, output_file)
+
+        print(f"\nФайл диаграммы сохранён: {output_file}")
 
     except (
         OSError,
